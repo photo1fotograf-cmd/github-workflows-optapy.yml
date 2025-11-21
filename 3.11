@@ -1,0 +1,292 @@
+import optapy
+from optapy import planning_entity, planning_solution, planning_variable, problem_fact_collection_property, planning_entity_collection_property, value_range_provider
+from optapy.score import HardSoftScore
+from optapy.constraint import ConstraintFactory
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
+
+# === Konstante ===
+INPUT_FILE = r"C:\Users\DejanPC\Desktop\Python\New folder\nastavnici_spojene_grupe.xlsx"
+OUTPUT_FILE = r"raspored_optapy_output.xlsx"
+
+DAYS = ["Ponedeljak", "Utorak", "Sreda", "Četvrtak", "Petak"]
+SLOTS_PER_DAY = 7
+
+COLOR_CICEVAC = "FFFF9999"  # svetlocrvena
+COLOR_KABINET = "FF99CCFF"  # svetloplava
+
+
+class Teacher:
+    def __init__(self, name, school, max_daily_hours, allowed_shifts):
+        self.name = name
+        self.school = school
+        self.max_daily_hours = max_daily_hours
+        self.allowed_shifts = allowed_shifts
+
+
+class Lesson:
+    def __init__(self, id_, teacher_name, group, school, kabinet):
+        self.id_ = id_
+        self.teacher_name = teacher_name
+        self.group = group
+        self.school = school
+        self.kabinet = kabinet
+
+
+@planning_entity
+class ScheduledLesson:
+    def __init__(self, lesson):
+        self.lesson = lesson
+        self.day = None
+        self.slot = None
+
+    @planning_variable(str, value_range_provider_refs=["dayRange"])
+    def get_day(self):
+        return self.day
+
+    def set_day(self, day):
+        self.day = day
+
+    @planning_variable(int, value_range_provider_refs=["slotRange"])
+    def get_slot(self):
+        return self.slot
+
+    def set_slot(self, slot):
+        self.slot = slot
+
+    def __repr__(self):
+        return f"{self.lesson.teacher_name}-{self.lesson.group} [{self.day} {self.slot}]"
+
+
+@planning_solution
+class TimetableSolution:
+    def __init__(self):
+        self.lessons = []
+        self.teacher_list = []
+        self._score = None
+
+    @problem_fact_collection_property(Teacher)
+    def get_teacher_list(self):
+        return self.teacher_list
+
+    @planning_entity_collection_property(ScheduledLesson)
+    def get_lessons(self):
+        return self.lessons
+
+    @value_range_provider(range_id="dayRange")
+    def get_day_range(self):
+        return DAYS
+
+    @value_range_provider(range_id="slotRange")
+    def get_slot_range(self):
+        return list(range(1, SLOTS_PER_DAY + 1))
+
+    @property
+    def score(self):
+        return self._score
+
+    @score.setter
+    def score(self, score):
+        self._score = score
+
+
+def get_shift(group: str):
+    g = str(group).strip()
+    if g.startswith(("1", "3")):
+        return "1-3"
+    elif g.startswith(("2", "4")):
+        return "2-4"
+    return "unknown"
+
+
+def define_constraints(constraint_factory: ConstraintFactory):
+    # 1) Nastavnik može biti samo na jednom mestu u isto vreme (hard)
+    teacher_conflict = (
+        constraint_factory.from_(ScheduledLesson)
+        .join(
+            ScheduledLesson,
+            optapy.joiners.equal(lambda l: l.day),
+            optapy.joiners.equal(lambda l: l.slot),
+            optapy.joiners.equal(lambda l: l.lesson.teacher_name),
+            optapy.joiners.less_than(lambda l: id(l)),  # simetrična deduplikacija
+        )
+        .penalize("Teacher time conflict", HardSoftScore.ofHard(1))
+    )
+
+    # 2) Kabinet može biti dodeljen samo jednom času u isto vreme (hard)
+    cabinet_conflict = (
+        constraint_factory.from_(ScheduledLesson)
+        .join(
+            ScheduledLesson,
+            optapy.joiners.equal(lambda l: l.day),
+            optapy.joiners.equal(lambda l: l.slot),
+            optapy.joiners.equal(lambda l: l.lesson.kabinet),
+            optapy.joiners.less_than(lambda l: id(l)),
+        )
+        .penalize("Cabinet time conflict", HardSoftScore.ofHard(1))
+    )
+
+    # 3) Nastavnik ne može imati časove u dve škole istog dana (hard)
+    #   Koristimo lesson.school jasno, umesto inferiranja iz kabineta.
+    teacher_two_schools_same_day = (
+        constraint_factory.from_(ScheduledLesson)
+        .join(
+            ScheduledLesson,
+            optapy.joiners.equal(lambda l: l.day),
+            optapy.joiners.equal(lambda l: l.lesson.teacher_name),
+            optapy.joiners.less_than(lambda l: id(l)),
+        )
+        .filter(lambda l1, l2: l1.lesson.school != l2.lesson.school)
+        .penalize("Teacher in two schools same day", HardSoftScore.ofHard(1))
+    )
+
+    # 4) Konflikt smena: nastavnik ne može imati časove u obe smene istog dana (hard)
+    shift_conflict = (
+        constraint_factory.from_(ScheduledLesson)
+        .join(
+            ScheduledLesson,
+            optapy.joiners.equal(lambda l: l.day),
+            optapy.joiners.equal(lambda l: l.lesson.teacher_name),
+            optapy.joiners.less_than(lambda l: id(l)),
+        )
+        .filter(lambda l1, l2: get_shift(l1.lesson.group) != get_shift(l2.lesson.group))
+        .penalize("Shift conflict", HardSoftScore.ofHard(1))
+    )
+
+    # 5) (Soft) Poželjno: ne prelaziti max_daily_hours po nastavniku
+    #   Ovo je agregat po (teacher, day). Kazna po prekoračenju.
+    teacher_daily_load = (
+        constraint_factory.from_(ScheduledLesson)
+        .group_by(
+            lambda l: (l.lesson.teacher_name, l.day),
+            optapy.function.count(),
+            optapy.function.min(lambda l: next(t for t in l.lesson_teacher_facts if t.name == l.lesson.teacher_name).max_daily_hours)  # placeholder, reši ispod
+        )
+        # Gore je komplikovano u OptaPy bez dodatnog modela; jednostavnije je soft constraint po slotu:
+        # Da ne uvodimo kompleksnu grupaciju, preskoči ovu tačku ili je modeluj kroz shadow var/constraint stream advanced.
+    )
+
+    # Vraćamo listu constraints (bez teacher_daily_load placeholdera).
+    return [
+        teacher_conflict,
+        cabinet_conflict,
+        teacher_two_schools_same_day,
+        shift_conflict,
+    ]
+
+
+def load_data():
+    df = pd.read_excel(INPUT_FILE)
+
+    teachers = {}
+    scheduled_lessons = []
+    base_lesson_id = 0
+
+    for _, row in df.iterrows():
+        teacher_name = str(row["Nastavnik"]).strip()
+        odeljenje = str(row["Odeljenje"]).strip()
+        weekly_hours = int(row["Časova nedeljno"])
+        kabinet = str(row["Kabinet"]).strip()
+
+        # Odredi školu eksplicitno na osnovu kabineta (ili kolone ako postoji zasebna)
+        school = "Čičevac" if ("Cicevac" in kabinet or "Čičevac" in kabinet) else "Kruševac"
+
+        if teacher_name not in teachers:
+            teachers[teacher_name] = Teacher(
+                name=teacher_name,
+                school=school,
+                max_daily_hours=7,
+                allowed_shifts={"1-3", "2-4"},
+            )
+
+        # Kreiraj bazni Lesson (identitet predmeta/grupe)
+        base_lesson = Lesson(base_lesson_id, teacher_name, odeljenje, school, kabinet)
+        base_lesson_id += 1
+
+        # Raširi u pojedinačne planirane jedinice
+        for _ in range(weekly_hours):
+            scheduled_lessons.append(ScheduledLesson(base_lesson))
+
+    return list(teachers.values()), scheduled_lessons
+
+
+def export_to_excel(solution: TimetableSolution):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Raspored časova"
+
+    zaglavlja = ["R.br", "Nastavnik", "Ukupno"] + [
+        f"{dan} {i+1}" for dan in DAYS for i in range(SLOTS_PER_DAY)
+    ]
+    ws.append(zaglavlja)
+
+    # Po nastavniku, inicijalno prazan raspored
+    nastavnici = {}
+    for sl in solution.lessons:
+        nastavnik = sl.lesson.teacher_name
+        if nastavnik not in nastavnici:
+            nastavnici[nastavnik] = {
+                "row": None,
+                "total": 0,
+                "schedule": {(day, slot): "" for day in DAYS for slot in range(1, SLOTS_PER_DAY + 1)},
+            }
+        # Ukupno = broj stvarno dodeljenih jedinica (ne weekly_hours iz ulaza)
+        if sl.day is not None and sl.slot is not None:
+            nastavnici[nastavnik]["total"] += 1
+            nastavnici[nastavnik]["schedule"][(sl.day, sl.slot)] = (
+                f"{sl.lesson.group}\n{sl.lesson.kabinet}"
+            )
+
+    # Upis redova
+    row_num = 2
+    for i, (nastavnik, podaci) in enumerate(sorted(nastavnici.items()), 1):
+        red = [i, nastavnik, podaci["total"]]
+        for dan in DAYS:
+            for slot in range(1, SLOTS_PER_DAY + 1):
+                sadrzaj = podaci["schedule"][(dan, slot)]
+                red.append(sadrzaj)
+        ws.append(red)
+        podaci["row"] = row_num
+        row_num += 1
+
+    # Kolorisanje po školi/kabinetu
+    for nastavnik, podaci in nastavnici.items():
+        for dan in DAYS:
+            for slot in range(1, SLOTS_PER_DAY + 1):
+                sadrzaj = podaci["schedule"][(dan, slot)]
+                if not sadrzaj:
+                    continue
+                kolor = None
+                if ("Čičevac" in sadrzaj) or ("Cicevac" in sadrzaj):
+                    kolor = PatternFill(start_color=COLOR_CICEVAC, end_color=COLOR_CICEVAC, fill_type="solid")
+                elif ("Kabinet" in sadrzaj) or ("lab" in sadrzaj.lower()):
+                    kolor = PatternFill(start_color=COLOR_KABINET, end_color=COLOR_KABINET, fill_type="solid")
+                if kolor:
+                    col_index = zaglavlja.index(f"{dan} {slot}") + 1
+                    ws.cell(row=podaci["row"], column=col_index).fill = kolor
+
+    wb.save(OUTPUT_FILE)
+    print(f"Raspored je sačuvan u {OUTPUT_FILE}")
+
+
+def main():
+    print("Učitavam podatke...")
+    teacher_list, lesson_list = load_data()
+
+    print("Kreiram rešenje...")
+    solution = TimetableSolution()
+    solution.teacher_list = teacher_list
+    solution.lessons = lesson_list
+
+    print("Pokrećem OptaPy solver...")
+    solver_factory = optapy.solver_factory_create_from_xml_resource("solver_config.xml")
+    solver = optapy.solver_factory_build_solver(solver_factory)
+    solution = solver.solve(solution)
+
+    print("Exportujem rezultate...")
+    export_to_excel(solution)
+
+
+if __name__ == "__main__":
+    main()
